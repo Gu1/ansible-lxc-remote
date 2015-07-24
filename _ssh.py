@@ -35,6 +35,7 @@ from ansible.callbacks import vvv
 from ansible import errors
 from ansible import utils
 
+
 class Connection(object):
     ''' ssh based connections '''
 
@@ -48,6 +49,9 @@ class Connection(object):
         self.private_key_file = private_key_file
         self.HASHED_KEY_MAGIC = "|1|"
         self.has_pipelining = True
+
+        # TODO: add pbrun, pfexec
+        self.become_methods_supported=['sudo', 'su', 'pbrun']
 
         fcntl.lockf(self.runner.process_lockfile, fcntl.LOCK_EX)
         self.cp_dir = utils.prepare_writeable_dir('$HOME/.ansible/cp',mode=0700)
@@ -142,11 +146,10 @@ class Connection(object):
             os.close(self.wfd)
 
     class CommunicateCallbacks(object):
-        def __init__(self, runner, indata, su=False, sudoable=False, prompt=None):
+        def __init__(self, runner, indata, sudoable=False, prompt=None):
             self.stdout = ''
             self.stderr = ''
             self.runner = runner
-            self.su = su
             self.sudoable = sudoable
             self.prompt = prompt
             if isinstance(indata, basestring) and indata:
@@ -157,22 +160,19 @@ class Connection(object):
                 self.indata = indata # file-like object
 
         def _check_for_su_sudo_fail(self, data):
-            if self.runner.sudo and self.sudoable:
-                if self.runner.sudo_pass:
-                    incorrect_password = gettext.dgettext(
-                        "sudo", "Sorry, try again.")
-                    if data.endswith("%s\r\n%s" % (incorrect_password,
-                                                   self.prompt)):
-                        raise errors.AnsibleError('Incorrect sudo password')
+            # fail early if the become password is wrong
+            if self.runner.become and self.sudoable:
+                incorrect_password = gettext.dgettext(self.runner.become_method, C.BECOME_ERROR_STRINGS[self.runner.become_method])
 
-                if data.endswith(self.prompt):
-                    raise errors.AnsibleError('Missing sudo password')
+                if self.prompt:
+                    if self.runner.become_pass:
+                        if data.endswith("%s\r\n%s" % (incorrect_password, self.prompt)):
+                            raise errors.AnsibleError('Incorrect become password')
 
-            if self.runner.su and su and self.runner.su_pass:
-                incorrect_password = gettext.dgettext(
-                    "su", "Sorry")
-                if data.endswith("%s\r\n%s" % (incorrect_password, self.prompt)):
-                    raise errors.AnsibleError('Incorrect su password')
+                    if data.endswith(self.prompt):
+                        raise errors.AnsibleError('Missing become password')
+                    elif data.endswith("%s\r\n%s" % (incorrect_password, self.prompt)):
+                        raise errors.AnsibleError('Incorrect become password')
 
         def stdout_cb(self, data):
             self.stdout += data
@@ -189,6 +189,7 @@ class Connection(object):
         fcntl.fcntl(p.stdout, fcntl.F_SETFL, fcntl.fcntl(p.stdout, fcntl.F_GETFL) & ~os.O_NONBLOCK)
         fcntl.fcntl(p.stderr, fcntl.F_SETFL, fcntl.fcntl(p.stderr, fcntl.F_GETFL) & ~os.O_NONBLOCK)
         # We can't use p.communicate here because the ControlMaster may have stdout open as well
+        rpipes = [p.stdout, p.stderr]
         rpipes = [p.stdout, p.stderr]
         wpipes = []
         if callable(callbacks[0]):
@@ -260,9 +261,12 @@ class Connection(object):
                 host_fh.close()
                 
             for line in data.split("\n"):
+                line = line.strip()
                 if line is None or " " not in line:
                     continue
                 tokens = line.split()
+                if not tokens:
+                    continue
                 if tokens[0].find(self.HASHED_KEY_MAGIC) == 0:
                     # this is a hashed known host entry
                     try:
@@ -284,7 +288,7 @@ class Connection(object):
         return True
 
     def send_su_sudo_password(self, p, stdin, success_key, sudoable, prompt):
-        # several cases are handled for sudo privileges with password
+        # several cases are handled for escalated privileges with password
         # * NOPASSWD (tty & no-tty): detect success_key on stdout
         # * without NOPASSWD:
         #   * detect prompt on stdout (tty)
@@ -293,15 +297,15 @@ class Connection(object):
                     fcntl.fcntl(p.stdout, fcntl.F_GETFL) | os.O_NONBLOCK)
         fcntl.fcntl(p.stderr, fcntl.F_SETFL,
                     fcntl.fcntl(p.stderr, fcntl.F_GETFL) | os.O_NONBLOCK)
-        sudo_output = ''
-        sudo_errput = ''
+        become_output = ''
+        become_errput = ''
         no_prompt_out = ''
         no_prompt_err = ''
 
         while True:
-            if success_key in sudo_output or \
-                (self.runner.sudo_pass and sudo_output.endswith(prompt)) or \
-                (self.runner.su_pass and utils.su_prompts.check_su_prompt(sudo_output)):
+            if success_key in become_output or \
+                (prompt and become_output.endswith(prompt)) or \
+                utils.su_prompts.check_su_prompt(become_output):
                 break
 
             rfd, wfd, efd = select.select([p.stdout, p.stderr], [],
@@ -309,39 +313,39 @@ class Connection(object):
             if p.stderr in rfd:
                 chunk = p.stderr.read()
                 if not chunk:
-                    raise errors.AnsibleError('ssh connection closed waiting for sudo or su password prompt')
-                sudo_errput += chunk
+                    raise errors.AnsibleError('ssh connection closed waiting for a privilege escalation password prompt')
+                become_errput += chunk
                 incorrect_password = gettext.dgettext(
-                    "sudo", "Sorry, try again.")
-                if sudo_errput.strip().endswith("%s%s" % (prompt, incorrect_password)):
-                    raise errors.AnsibleError('Incorrect sudo password')
-                elif sudo_errput.endswith(prompt):
-                    stdin.write(self.runner.sudo_pass + '\n')
+                    "become", "Sorry, try again.")
+                if become_errput.strip().endswith("%s%s" % (prompt, incorrect_password)):
+                    raise errors.AnsibleError('Incorrect become password')
+                elif prompt and become_errput.endswith(prompt):
+                    stdin.write(self.runner.become_pass + '\n')
 
             if p.stdout in rfd:
                 chunk = p.stdout.read()
                 if not chunk:
-                    raise errors.AnsibleError('ssh connection closed waiting for sudo or su password prompt')
-                sudo_output += chunk
+                    raise errors.AnsibleError('ssh connection closed waiting for %s password prompt' % self.runner.become_method)
+                become_output += chunk
 
             if not rfd:
                 # timeout. wrap up process communication
                 stdout = p.communicate()
-                raise errors.AnsibleError('ssh connection error waiting for sudo or su password prompt')
+                raise errors.AnsibleError('ssh connection error while waiting for %s password prompt' % self.runner.become_method)
 
-        if success_key not in sudo_output:
-            if sudoable:
-                stdin.write(self.runner.sudo_pass + '\n')
-            elif su:
-                stdin.write(self.runner.su_pass + '\n')
-        else:
-            no_prompt_out += sudo_output
-            no_prompt_err += sudo_errput
+        if success_key in become_output:
+            no_prompt_out += become_output
+            no_prompt_err += become_errput
+        elif sudoable:
+            stdin.write(self.runner.become_pass + '\n')
 
         return no_prompt_out, no_prompt_err
 
-    def exec_command(self, cmd, tmp_path, sudo_user=None, sudoable=False, executable='/bin/sh', in_data=None, su_user=None, su=False):
+    def exec_command(self, cmd, tmp_path, become_user=None, sudoable=False, executable='/bin/sh', in_data=None):
         ''' run a command on the remote host '''
+
+        if sudoable and self.runner.become and self.runner.become_method not in self.become_methods_supported:
+            raise errors.AnsibleError("Internal Error: this module does not support running commands via %s" % self.runner.become_method)
 
         ssh_cmd = self._password_cmd()
         ssh_cmd += ["ssh", "-C"]
@@ -353,32 +357,32 @@ class Connection(object):
         if utils.VERBOSITY > 3:
             ssh_cmd += ["-vvv"]
         else:
-            ssh_cmd += ["-q"]
+            if self.runner.module_name == 'raw':
+                ssh_cmd += ["-q"]
+            else:
+                ssh_cmd += ["-v"]
         ssh_cmd += self.common_args
 
         if self.ipv6:
             ssh_cmd += ['-6']
         ssh_cmd += [self.host]
 
-        if su and su_user:
-            sudocmd, prompt, success_key = utils.make_su_cmd(su_user, executable, cmd)
-            ssh_cmd.append(sudocmd)
-        elif not self.runner.sudo or not sudoable:
+        if self.runner.become and sudoable:
+            becomecmd, prompt, success_key = utils.make_become_cmd(cmd, become_user, executable, self.runner.become_method, '', self.runner.become_exe)
+            ssh_cmd.append(becomecmd)
+        else:
             prompt = None
             if executable:
                 ssh_cmd.append(executable + ' -c ' + pipes.quote(cmd))
             else:
                 ssh_cmd.append(cmd)
-        else:
-            sudocmd, prompt, success_key = utils.make_sudo_cmd(sudo_user, executable, cmd)
-            ssh_cmd.append(sudocmd)
 
         vvv("EXEC %s" % ' '.join(ssh_cmd), host=self.host)
 
         not_in_host_file = self.not_in_host_file(self.host)
 
         if C.HOST_KEY_CHECKING and not_in_host_file:
-            # lock around the initial SSH connectivity so the user prompt about whether to add 
+            # lock around the initial SSH connectivity so the user prompt about whether to add
             # the host to known hosts is not intermingled with multiprocess output.
             fcntl.lockf(self.runner.process_lockfile, fcntl.LOCK_EX)
             fcntl.lockf(self.runner.output_lockfile, fcntl.LOCK_EX)
@@ -390,11 +394,10 @@ class Connection(object):
 
         no_prompt_out = ''
         no_prompt_err = ''
-        if (self.runner.sudo and sudoable and self.runner.sudo_pass) or \
-                (self.runner.su and su and self.runner.su_pass):
+        if sudoable and self.runner.become and self.runner.become_pass:
             (no_prompt_out, no_prompt_err) = self.send_su_sudo_password(p, stdin, success_key, sudoable, prompt)
 
-        com = self.CommunicateCallbacks(self.runner, in_data, su=su, sudoable=sudoable, prompt=prompt)
+        com = self.CommunicateCallbacks(self.runner, in_data, sudoable=sudoable, prompt=prompt)
         returncode = self._communicate(p, stdin, callbacks=(com.stdin_cb, com.stdout_cb, com.stderr_cb))
 
         if C.HOST_KEY_CHECKING and not_in_host_file:
@@ -413,6 +416,27 @@ class Connection(object):
             raise errors.AnsibleError('using -c ssh on certain older ssh versions may not support ControlPersist, set ANSIBLE_SSH_ARGS="" (or ssh_args in [ssh_connection] section of the config file) before running again')
         if p.returncode == 255 and (in_data or self.runner.module_name == 'raw'):
             raise errors.AnsibleError('SSH Error: data could not be sent to the remote host. Make sure this host can be reached over ssh')
+        if p.returncode == 255:
+            ip = None
+            port = None
+            for line in stderr.splitlines():
+                match = re.search(
+                    'Connecting to .*\[(\d+\.\d+\.\d+\.\d+)\] port (\d+)',
+                    line)
+                if match:
+                    ip = match.group(1)
+                    port = match.group(2)
+            if 'UNPROTECTED PRIVATE KEY FILE' in stderr:
+                lines = [line for line in stderr.splitlines()
+                         if 'ignore key:' in line]
+            else:
+                lines = stderr.splitlines()[-1:]
+            if ip and port:
+                lines.append('    while connecting to %s:%s' % (ip, port))
+            lines.append(
+                'It is sometimes useful to re-run the command using -vvvv, '
+                'which prints SSH debug output to help diagnose the issue.')
+            raise errors.AnsibleError('SSH Error: %s' % '\n'.join(lines))
 
         return (p.returncode, '', no_prompt_out + com.stdout, no_prompt_err + com.stderr)
 

@@ -72,10 +72,8 @@ class Connection(ssh.Connection):
                    pipes.quote(cmd))
 
     def _su_sudo_cmd(self, cmd):
-        if self.runner.su and self.runner.su_user:
-            return utils.make_su_cmd(self.runner.su_user, '/bin/sh', cmd)
-        elif self.runner.sudo:
-            return utils.make_sudo_cmd(self.runner.sudo_user, '/bin/sh', cmd)
+        if self.runner.become:
+            return utils.make_become_cmd(cmd, self.runner.become_user, '/bin/sh', self.runner.become_method, '', self.runner.become_exe)
         else:
             return cmd, None, None
 
@@ -85,7 +83,6 @@ class Connection(ssh.Connection):
     @lxc_check
     def exec_command(self, cmd, tmp_path, *args, **kwargs):
         kwargs['sudoable'] = True
-        kwargs['su'] = True
         #if kwargs.get('sudoable', False) or kwargs.get('su', False):
         cmd = self._lxc_cmd(cmd)
         rc, stdin, stdout, stderr = super(Connection, self).exec_command(cmd, tmp_path, *args, **kwargs)
@@ -114,13 +111,12 @@ class Connection(ssh.Connection):
 
         (p, stdin) = self._run(cmd, True)
         self._send_password()
-        if (self.runner.sudo and self.runner.sudo_pass) or \
-                (self.runner.su and self.runner.su_pass):
+        if self.runner.become and self.runner.become_pass:
             (no_prompt_out, no_prompt_err) = self.send_su_sudo_password(p, stdin, success_key,
                                                                         True, prompt)
 
         com = self.CommunicateCallbacks(self.runner, open(in_path, 'r'),
-                                        su=True, sudoable=True, prompt=prompt)
+                                        sudoable=True, prompt=prompt)
         returncode = self._communicate(p, stdin, callbacks=(com.stdin_cb, com.stdout_cb, com.stderr_cb))
 
         if com.stdout[-4:] != 'done':
