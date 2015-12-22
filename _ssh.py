@@ -419,18 +419,18 @@ class Connection(object):
         if p.returncode == 255:
             ip = None
             port = None
-            for line in stderr.splitlines():
+            for line in com.stderr.splitlines():
                 match = re.search(
                     'Connecting to .*\[(\d+\.\d+\.\d+\.\d+)\] port (\d+)',
                     line)
                 if match:
                     ip = match.group(1)
                     port = match.group(2)
-            if 'UNPROTECTED PRIVATE KEY FILE' in stderr:
-                lines = [line for line in stderr.splitlines()
+            if 'UNPROTECTED PRIVATE KEY FILE' in com.stderr:
+                lines = [line for line in com.stderr.splitlines()
                          if 'ignore key:' in line]
             else:
-                lines = stderr.splitlines()[-1:]
+                lines = com.stderr.splitlines()[-1:]
             if ip and port:
                 lines.append('    while connecting to %s:%s' % (ip, port))
             lines.append(
